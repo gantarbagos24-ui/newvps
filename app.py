@@ -297,18 +297,6 @@ async def login(req):
     try:return web.json_response({'ok':True,'account':await connect_account(str(u).strip(),str(p),0)})
     except Exception as e:return web.json_response({'ok':False,'status':classify_login_failure(e),'error':safe_error(e)},status=401)
 
-async def login_batch(req):
-    b=await json_body(req); inp=as_list(b.get('accounts'))[:10]
-    if not inp:return web.json_response({'ok':False,'error':'Tidak ada Troop untuk login.'},status=400)
-    async def one(i,item):
-        if not isinstance(item, dict):
-            return {'index':i,'ok':False,'error':'Data akun tidak valid.'}
-        u=str(item.get('username','')).strip(); p=str(item.get('password','')); idx=item.get('index',i)
-        if not u or not p:return {'index':idx,'ok':False,'error':'Nama dan password kosong.'}
-        if item.get('sessionId'): await close_session(str(item['sessionId']),'relogin')
-        try:return {'index':idx,'ok':True,'account':await connect_account(u,p,idx)}
-        except Exception as e:return {'index':idx,'ok':False,'username':u,'status':classify_login_failure(e),'error':safe_error(e)}
-    results=await asyncio.gather(*(one(i,x) for i,x in enumerate(inp))); return web.json_response({'ok':any(x['ok'] for x in results),'results':results})
 
 async def action(req):
     b=await json_body(req)
@@ -352,34 +340,6 @@ async def balance_all(req):
     results=await asyncio.gather(*(one(x) for x in ids)); success=sum(x['ok'] for x in results)
     return web.json_response({'ok':success>0,'action':'balance','sent':len(ids),'success':success,'total':len(ids),'results':results})
 
-async def batch_action(req):
-    b=await json_body(req)
-    ids=clean_session_ids(b.get('sessionIds'), 10)
-    act=str(b.get('action') or '').strip(); room=normalize_room(b.get('room')); target=str(b.get('targetUsername') or '').strip(); msg=b.get('message')
-    if not ids or not act:return web.json_response({'ok':False,'error':'Session atau action tidak lengkap.'},status=400)
-    if act in ('join','leave','participants','kick','message') and not room:return web.json_response({'ok':False,'error':'Room wajib diisi.'},status=400)
-    if act=='kick' and not target:return web.json_response({'ok':False,'error':'Target kick wajib diisi.'},status=400)
-    if act=='message' and not msg:return web.json_response({'ok':False,'error':'Pesan wajib diisi.'},status=400)
-    types={'join':'room.join','leave':'room.leave','participants':'room.participants','balance':'wallet.balance','kick':'room.kick','message':'room.send_message'}
-    if act not in types:return web.json_response({'ok':False,'error':'Action tidak dikenal.'},status=400)
-    payload={'type':types[act]}
-    if act in ('join','leave','participants','kick','message'): payload['room']=room
-    if act=='kick':payload['target_username']=target
-    if act=='message':payload['message']=msg
-    results=[]
-    for sid in ids:
-        try:
-            if act=='join':
-                account=sessions.get(sid)
-                if not account: raise RuntimeError('Session tidak ditemukan / sudah terputus.')
-                account['joinRequestedRoom']=room
-                account['joinStatus']='pending'
-                account['joinError']=None
-            await send(sid,payload)
-            results.append({'sessionId':sid,'ok':True,'room':room or None})
-        except Exception as e:
-            results.append({'sessionId':sid,'ok':False,'error':safe_error(e),'room':room or None})
-    return web.json_response({'ok':any(x['ok'] for x in results),'action':act,'room':room or None,'sent':sum(x['ok'] for x in results),'total':len(results),'results':results})
 
 async def kick_loop(req):
     b=await json_body(req)
@@ -526,16 +486,6 @@ async def events(req):
 
 async def logout(req):
     b=await json_body(req); await close_session(str(b.get('sessionId','')),'logout'); return web.json_response({'ok':True})
-async def logout_batch(req):
-    b=await json_body(req)
-    ids = clean_session_ids(b.get('sessionIds'), 10)
-    # If the client sends no IDs, close every currently tracked session.
-    if not ids:
-        ids = list(sessions)
-    results = await asyncio.gather(*(close_session(x, 'logout all') for x in ids), return_exceptions=True)
-    closed = sum(1 for result in results if result is True)
-    errors = [str(result) for result in results if isinstance(result, Exception)]
-    return web.json_response({'ok': not errors, 'closed': closed, 'requested': len(ids), 'errors': errors})
 
 app=web.Application(client_max_size=128*1024)
 
@@ -544,7 +494,7 @@ async def shutdown_cleanup(app):
         await close_session(sid,'shutdown')
 
 app.on_cleanup.append(shutdown_cleanup)
-for path,handler,method in [('/api/health',health,'get'),('/api/login',login,'post'),('/api/login-batch',login_batch,'post'),('/api/action',action,'post'),('/api/balance-all',balance_all,'post'),('/api/batch-action',batch_action,'post'),('/api/kick-loop',kick_loop,'post'),('/api/kick-progress-stream',kick_stream,'get'),('/api/kick-progress-state',kick_state,'get'),('/api/events',events,'get'),('/api/room-status',room_status,'get'),('/api/logout',logout,'post'),('/api/logout-batch',logout_batch,'post')]: app.router.add_route(method,path,handler)
+for path,handler,method in [('/api/health',health,'get'),('/api/login',login,'post'),('/api/action',action,'post'),('/api/balance-all',balance_all,'post'),('/api/kick-loop',kick_loop,'post'),('/api/kick-progress-stream',kick_stream,'get'),('/api/kick-progress-state',kick_state,'get'),('/api/events',events,'get'),('/api/room-status',room_status,'get'),('/api/logout',logout,'post')]: app.router.add_route(method,path,handler)
 async def index(req):
     return web.FileResponse(os.path.join(os.path.dirname(__file__), 'public', 'index.html'))
 
