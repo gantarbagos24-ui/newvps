@@ -772,50 +772,12 @@ async function logoutOne(i, silent=false){
   if(!silent) ;
 }
 
-async function batchAction(action, extra={}){
-  const ids = accounts.map(a => a.sessionId).filter(Boolean);
-  if(!ids.length){ ; return null; }
-  try{
-    const r = await fetch("/api/batch-action", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({sessionIds:ids, action, ...extra})});
-    const j = await r.json();
-    if(!j.ok){ ; return null; }
-    return j;
-  }catch(e){
-    return null;
-  }
-}
-
 async function loginAll(){
   sync();
-  const list = accounts.map((a, i) => ({index:i, username:a.username, password:a.password, sessionId:a.sessionId})).filter(a => a.username && a.password);
-  if(!list.length){ ; return; }
-  list.forEach(a => setStatus(a.index, "LOGIN…"));
-  try{
-    const r = await fetch("/api/login-batch", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({accounts:list})});
-    const j = await r.json();
-    for(const item of (j.results || [])){
-      const i = item.index;
-      if(item.ok){
-        accounts[i].sessionId = item.account.sessionId;
-        const w = item.account.wallet;
-        if(w?.balance_cr != null) setBalance(i, w.balance_cr);
-        else if(w?.label) setBalance(i, w.label);
-        else setBalance(i, "-");
-        setStatus(i, "ONLINE");
-        openEvents(i);
-          } else {
-        accounts[i].sessionId = null;
-        const status = String(item.status || "error").toUpperCase() === "SUSPEND" ? "SUSPEND" : "ERROR";
-        setStatus(i, status);
-        setBalance(i, "-");
-      }
-    }
-    const ok = (j.results || []).filter(x => x.ok).length;
-    const total = (j.results || []).length;
-    for(const item of (j.results || [])) if(!item.ok) ;
-  }catch(e){
-    for(const a of list) setStatus(a.index, "ERROR");
-  }
+  const indexes = accounts.map((a, i) => (a.username && a.password) ? i : -1).filter(i => i >= 0);
+  if(!indexes.length){ ; return; }
+  indexes.forEach(i => setStatus(i, "LOGIN…"));
+  await Promise.all(indexes.map(i => loginOne(i)));
   resetKickAllProgress("Progress KICK ALL di-reset setelah LOGIN ALL.");
 }
 
@@ -843,36 +805,17 @@ function toggleAccountCommands(){
 }
 
 async function logoutAll(){
-  // Invalidate session IDs BEFORE closing EventSource.
-  const ids = accounts.map(a => a.sessionId).filter(Boolean);
-  const previous = accounts.map(a => ({ sessionId: a.sessionId, eventSource: a.eventSource }));
-
-  for(const a of accounts){
-    a.sessionId = null;
-    a.eventSource = null;
+  const indexes = accounts.map((a, i) => a.sessionId ? i : -1).filter(i => i >= 0);
+  if(!indexes.length){
+    for(let i=0; i<accounts.length; i++){
+      setStatus(i, "OFFLINE");
+      setBalance(i, "-");
+    }
+    return {ok:true, closed:0, requested:0};
   }
-
-  for(const item of previous){
-    if(item.eventSource) try{ item.eventSource.close(); }catch{}
-  }
-
-  for(let i=0; i<accounts.length; i++){
-    setStatus(i, "OFFLINE");
-    setBalance(i, "-");
-  }
-
-  let result = null;
-  try{
-    const r = await fetch("/api/logout-batch", {
-      method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({sessionIds:ids})
-    });
-    result = await r.json();
-  }catch{}
-
+  const results = await Promise.all(indexes.map(i => logoutOne(i, true)));
   resetKickAllProgress("Progress KICK ALL di-reset karena semua WebSocket logout.");
-  return result;
+  return {ok:true, closed:results.filter(Boolean).length, requested:indexes.length};
 }
 
 el("resetTimerButton")?.addEventListener("click", resetTimer);
@@ -984,46 +927,79 @@ async function joinAll(){
   const room = el("room").value.trim().replace(/\s+/g, " ");
   const statusEl = el("roomJoinStatus");
   if(!room){ if(statusEl) statusEl.textContent = "Room wajib diisi"; return; }
-  if(statusEl) statusEl.textContent = "JOIN…";
-  const result = await batchAction("join", {room});
-  if(!result){ if(statusEl) statusEl.textContent = "JOIN gagal"; return; }
 
-  const okResults = (result.results || []).filter(x => x.ok && x.sessionId);
-  if(!okResults.length){
+  const active = accounts
+    .map((a, i) => ({sessionId:a.sessionId, index:i}))
+    .filter(x => x.sessionId);
+  if(!active.length){
     if(statusEl) statusEl.textContent = "Tidak ada WebSocket aktif";
     return;
   }
 
-  // batch-action hanya memastikan command berhasil dikirim. Verifikasi status
-  // join per WebSocket supaya UI tidak menganggap room sudah masuk sebelum API
-  // benar-benar mengirim room.join.result.
-  const checks = await Promise.all(okResults.map(async item => {
+  if(statusEl) statusEl.textContent = `JOIN 0/${active.length}…`;
+
+  const results = await Promise.all(active.map(async item => {
+    try{
+      const r = await fetch("/api/action", {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({sessionId:item.sessionId, action:"join", room})
+      });
+      const j = await r.json();
+      return {...item, ok:Boolean(j.ok), error:j.error || null};
+    }catch(e){
+      return {...item, ok:false, error:e.message || String(e)};
+    }
+  }));
+
+  const sent = results.filter(x => x.ok);
+  if(!sent.length){
+    if(statusEl) statusEl.textContent = "JOIN gagal";
+    return;
+  }
+
+  const checks = await Promise.all(sent.map(async item => {
     const deadline = Date.now() + 8500;
     while(Date.now() < deadline){
       try{
         const r = await fetch(`/api/room-status?sessionId=${encodeURIComponent(item.sessionId)}`, {cache:"no-store"});
         const j = await r.json();
-        if(j.joinStatus === "joined") return j;
-        if(j.joinStatus === "error") return j;
+        if(j.joinStatus === "joined") return {...item, ...j};
+        if(j.joinStatus === "error") return {...item, ...j};
       }catch{}
       await new Promise(resolve => setTimeout(resolve, 250));
     }
-    return {joinStatus:"timeout", requestedRoom:room};
+    return {...item, joinStatus:"timeout", requestedRoom:room};
   }));
 
   const joined = checks.filter(x => x.joinStatus === "joined");
-  const failed = checks.filter(x => x.joinStatus !== "joined");
+  const failed = active.length - joined.length;
   if(statusEl){
-    if(joined.length && !failed.length) statusEl.textContent = `JOIN OK: ${joined[0].joinedRoom || room}`;
-    else if(joined.length) statusEl.textContent = `JOIN ${joined.length}/${checks.length}: ${joined[0].joinedRoom || room}`;
-    else statusEl.textContent = failed[0]?.joinError || `JOIN gagal: ${failed[0]?.joinStatus || "timeout"}`;
+    if(joined.length === active.length) statusEl.textContent = `JOIN OK: ${room}`;
+    else if(joined.length) statusEl.textContent = `JOIN ${joined.length}/${active.length}: ${room}`;
+    else statusEl.textContent = checks[0]?.joinError || "JOIN gagal/timeout";
   }
+  return {ok:joined.length > 0, sent:sent.length, joined:joined.length, failed, total:active.length, results};
 }
 
 async function leaveAll(){
   const room = el("room").value.trim();
-  if(!room){ ; return; }
-  await batchAction("leave", {room});
+  if(!room) return;
+
+  const active = accounts
+    .map((a, i) => ({sessionId:a.sessionId, index:i}))
+    .filter(x => x.sessionId);
+  if(!active.length) return;
+
+  await Promise.all(active.map(async item => {
+    try{
+      await fetch("/api/action", {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({sessionId:item.sessionId, action:"leave", room})
+      });
+    }catch{}
+  }));
   resetKickAllProgress("Progress KICK ALL di-reset karena semua WebSocket meninggalkan room.");
 }
 
