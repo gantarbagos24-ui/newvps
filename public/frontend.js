@@ -9,70 +9,6 @@ function esc(v){
   return String(v??"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/\"/g,"&quot;");
 }
 
-function ensureActionDiagnostics(){
-  let node = document.getElementById("actionDiagnostics");
-  if(node) return node;
-  node = document.createElement("div");
-  node.id = "actionDiagnostics";
-  node.setAttribute("role", "status");
-  node.setAttribute("aria-live", "polite");
-  node.className = "fixed left-3 right-3 bottom-3 z-[9999] hidden rounded-xl border px-3 py-2 text-xs shadow-2xl backdrop-blur-xl";
-  document.body.appendChild(node);
-  return node;
-}
-
-let actionNoticeTimer = 0;
-function showActionNotice(action, message, kind="error"){
-  const node = ensureActionDiagnostics();
-  const safeAction = esc(action || "ACTION");
-  const safeMessage = esc(message || "Terjadi kesalahan.");
-  node.innerHTML = `<div class="font-bold mb-0.5">${safeAction}</div><div class="break-words">${safeMessage}</div>`;
-  node.classList.remove("hidden", "border-rose-700/60", "bg-rose-950/90", "text-rose-200", "border-emerald-700/60", "bg-emerald-950/90", "text-emerald-200", "border-amber-700/60", "bg-amber-950/90", "text-amber-200");
-  if(kind === "success") node.classList.add("border-emerald-700/60", "bg-emerald-950/90", "text-emerald-200");
-  else if(kind === "warning") node.classList.add("border-amber-700/60", "bg-amber-950/90", "text-amber-200");
-  else node.classList.add("border-rose-700/60", "bg-rose-950/90", "text-rose-200");
-  if(actionNoticeTimer) clearTimeout(actionNoticeTimer);
-  if(kind === "success") actionNoticeTimer = setTimeout(() => node.classList.add("hidden"), 4500);
-}
-
-function describeApiError(action, response, bodyText="", parsed=null){
-  const status = response?.status ? `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}` : "HTTP error";
-  const serverMessage = parsed?.error || parsed?.message || parsed?.detail;
-  if(serverMessage) return `${status}: ${serverMessage}`;
-  const raw = String(bodyText || "").replace(/\s+/g, " ").trim();
-  if(raw) return `${status}: ${raw.slice(0, 240)}`;
-  return `${status}: server tidak memberikan detail error.`;
-}
-
-async function requestJson(url, options={}, action="REQUEST"){
-  let response;
-  let bodyText = "";
-  try{
-    response = await fetch(url, options);
-    bodyText = await response.text();
-  }catch(error){
-    const message = error?.message || String(error || "Network error");
-    throw new Error(`${action}: gagal terhubung ke server (${message}).`);
-  }
-
-  let parsed = null;
-  if(bodyText){
-    try{ parsed = JSON.parse(bodyText); }
-    catch{
-      if(!response.ok) throw new Error(describeApiError(action, response, bodyText));
-      throw new Error(`${action}: server mengirim response yang bukan JSON.`);
-    }
-  }
-
-  if(!response.ok){
-    throw new Error(describeApiError(action, response, bodyText, parsed));
-  }
-  if(!parsed || typeof parsed !== "object"){
-    throw new Error(`${action}: response JSON kosong/tidak valid.`);
-  }
-  return parsed;
-}
-
 function sync(){
   for(let i=0; i<10; i++){
     if(el(`u${i}`)) accounts[i].username = el(`u${i}`).value.trim();
@@ -828,41 +764,23 @@ async function logoutOne(i, silent=false){
   if(a.eventSource) try{ a.eventSource.close(); }catch{}
   a.eventSource = null;
   if(a.sessionId){
-    try{
-      const oldSessionId = a.sessionId;
-      const j = await requestJson("/api/logout", {
-        method:"POST",
-        headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({sessionId:oldSessionId})
-      }, `LOGOUT T${i+1}`);
-      if(!j.ok) throw new Error(j.error || "Logout gagal.");
-    }catch(e){
-      if(!silent) showActionNotice(`LOGOUT T${i+1}`, e.message || String(e));
-    }
+    try{ await fetch("/api/logout", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({sessionId:a.sessionId})}); }catch{}
   }
   a.sessionId = null;
   setStatus(i, "OFFLINE");
   setBalance(i, "-");
+  if(!silent) ;
 }
 
 async function batchAction(action, extra={}){
   const ids = accounts.map(a => a.sessionId).filter(Boolean);
-  if(!ids.length){
-    showActionNotice(action === "join" ? "JOIN" : String(action).toUpperCase(), "Tidak ada WebSocket yang sedang ONLINE.", "warning");
-    return null;
-  }
+  if(!ids.length){ ; return null; }
   try{
-    const j = await requestJson("/api/batch-action", {
-      method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({sessionIds:ids, action, ...extra})
-    }, `BATCH ${String(action).toUpperCase()}`);
-    if(!j.ok){
-      throw new Error(j.error || `BATCH ${String(action).toUpperCase()} gagal.`);
-    }
+    const r = await fetch("/api/batch-action", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({sessionIds:ids, action, ...extra})});
+    const j = await r.json();
+    if(!j.ok){ ; return null; }
     return j;
   }catch(e){
-    showActionNotice(`BATCH ${String(action).toUpperCase()}`, e.message || String(e));
     return null;
   }
 }
@@ -925,7 +843,7 @@ function toggleAccountCommands(){
 }
 
 async function logoutAll(){
-  // Invalidate session IDs BEFORE closing EventSource, as in the original flow.
+  // Invalidate session IDs BEFORE closing EventSource.
   const ids = accounts.map(a => a.sessionId).filter(Boolean);
   const previous = accounts.map(a => ({ sessionId: a.sessionId, eventSource: a.eventSource }));
 
@@ -943,30 +861,18 @@ async function logoutAll(){
     setBalance(i, "-");
   }
 
-  if(!ids.length){
-    showActionNotice("LOGOUT ALL", "Tidak ada WebSocket yang sedang ONLINE.", "warning");
-    resetKickAllProgress("Progress KICK ALL di-reset karena semua WebSocket logout.");
-    return {ok:true, closed:0, requested:0};
-  }
-
+  let result = null;
   try{
-    const result = await requestJson("/api/logout-batch", {
+    const r = await fetch("/api/logout-batch", {
       method:"POST",
       headers:{"Content-Type":"application/json"},
       body:JSON.stringify({sessionIds:ids})
-    }, "LOGOUT ALL");
-    if(!result.ok){
-      const details = Array.isArray(result.errors) && result.errors.length ? ` ${result.errors.join(" | ")}` : "";
-      throw new Error(result.error || `Server gagal logout ${result.closed ?? 0}/${result.requested ?? ids.length}.${details}`);
-    }
-    showActionNotice("LOGOUT ALL", `Berhasil logout ${result.closed ?? ids.length}/${result.requested ?? ids.length} WebSocket.`, "success");
-    resetKickAllProgress("Progress KICK ALL di-reset karena semua WebSocket logout.");
-    return result;
-  }catch(e){
-    showActionNotice("LOGOUT ALL", e.message || String(e));
-    resetKickAllProgress("Progress KICK ALL di-reset karena semua WebSocket logout.");
-    return null;
-  }
+    });
+    result = await r.json();
+  }catch{}
+
+  resetKickAllProgress("Progress KICK ALL di-reset karena semua WebSocket logout.");
+  return result;
 }
 
 el("resetTimerButton")?.addEventListener("click", resetTimer);
@@ -1077,25 +983,14 @@ el("logoutAll").onclick = logoutAll;
 async function joinAll(){
   const room = el("room").value.trim().replace(/\s+/g, " ");
   const statusEl = el("roomJoinStatus");
-  if(!room){
-    if(statusEl) statusEl.textContent = "Room wajib diisi";
-    showActionNotice("JOIN", "Room wajib diisi.", "warning");
-    return;
-  }
+  if(!room){ if(statusEl) statusEl.textContent = "Room wajib diisi"; return; }
   if(statusEl) statusEl.textContent = "JOIN…";
   const result = await batchAction("join", {room});
-  if(!result){
-    if(statusEl) statusEl.textContent = "JOIN gagal";
-    return;
-  }
+  if(!result){ if(statusEl) statusEl.textContent = "JOIN gagal"; return; }
 
   const okResults = (result.results || []).filter(x => x.ok && x.sessionId);
-  const failedDispatches = (result.results || []).filter(x => !x.ok);
   if(!okResults.length){
-    const detail = failedDispatches.map(x => `WS ${x.websocket || x.sessionId || "?"}: ${x.error || "gagal mengirim join"}`).join(" | ");
-    const message = detail || "Tidak ada WebSocket aktif yang berhasil menerima perintah JOIN.";
-    if(statusEl) statusEl.textContent = `JOIN gagal: ${message}`;
-    showActionNotice("JOIN", message);
+    if(statusEl) statusEl.textContent = "Tidak ada WebSocket aktif";
     return;
   }
 
@@ -1104,38 +999,24 @@ async function joinAll(){
   // benar-benar mengirim room.join.result.
   const checks = await Promise.all(okResults.map(async item => {
     const deadline = Date.now() + 8500;
-    let lastError = "";
     while(Date.now() < deadline){
       try{
-        const j = await requestJson(`/api/room-status?sessionId=${encodeURIComponent(item.sessionId)}`, {cache:"no-store"}, "ROOM STATUS");
+        const r = await fetch(`/api/room-status?sessionId=${encodeURIComponent(item.sessionId)}`, {cache:"no-store"});
+        const j = await r.json();
         if(j.joinStatus === "joined") return j;
         if(j.joinStatus === "error") return j;
-        if(j.joinStatus === "timeout") return j;
-        if(j.joinError) lastError = String(j.joinError);
-      }catch(e){
-        lastError = e.message || String(e);
-        break;
-      }
+      }catch{}
       await new Promise(resolve => setTimeout(resolve, 250));
     }
-    return {joinStatus:"timeout", requestedRoom:room, joinError:lastError || `Timeout menunggu status JOIN ${room}.`};
+    return {joinStatus:"timeout", requestedRoom:room};
   }));
 
   const joined = checks.filter(x => x.joinStatus === "joined");
   const failed = checks.filter(x => x.joinStatus !== "joined");
-  const failedText = failed.map(x => x.joinError || x.joinStatus || "gagal").filter(Boolean).join(" | ");
   if(statusEl){
     if(joined.length && !failed.length) statusEl.textContent = `JOIN OK: ${joined[0].joinedRoom || room}`;
     else if(joined.length) statusEl.textContent = `JOIN ${joined.length}/${checks.length}: ${joined[0].joinedRoom || room}`;
-    else statusEl.textContent = `JOIN gagal: ${failedText || "timeout"}`;
-  }
-
-  if(joined.length && !failed.length){
-    showActionNotice("JOIN", `Berhasil JOIN ${joined.length}/${checks.length} WebSocket ke ${joined[0].joinedRoom || room}.`, "success");
-  }else if(joined.length){
-    showActionNotice("JOIN", `Sebagian berhasil: ${joined.length}/${checks.length}. ${failedText || "Sebagian WebSocket gagal."}`, "warning");
-  }else{
-    showActionNotice("JOIN", failedText || "Semua WebSocket gagal JOIN.");
+    else statusEl.textContent = failed[0]?.joinError || `JOIN gagal: ${failed[0]?.joinStatus || "timeout"}`;
   }
 }
 
@@ -1150,37 +1031,21 @@ async function leaveAll(){
 
 async function participants(){
   const room = el("room").value.trim();
-  if(!room){
-    showActionNotice("LIST USER", "Room wajib diisi.", "warning");
-    return;
-  }
+  if(!room){ ; return; }
   clearParticipants();
   const sessionId = accounts.map(a => a.sessionId).filter(Boolean)[0];
-  if(!sessionId){
-    const message = "Tidak ada WebSocket yang sedang ONLINE.";
-    el("participantsList").innerHTML = `<div class="flex items-center justify-center h-full text-xs text-rose-300 py-10 px-3 text-center">${esc(message)}</div>`;
-    showActionNotice("LIST USER", message, "warning");
-    return;
-  }
+  if(!sessionId){ ; return; }
   try{
-    const j = await requestJson("/api/action", {
-      method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({sessionId, action:"participants", room})
-    }, "LIST USER");
-    if(!j.ok) throw new Error(j.error || "LIST USER gagal.");
+    const r = await fetch("/api/action", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({sessionId, action:"participants", room})});
+    const j = await r.json();
+    if(!j.ok){ ; return; }
     const list = extractParticipantNames(j.event || j);
     if(list.length){
       renderParticipants(list, false);
-      showActionNotice("LIST USER", `Berhasil mengambil ${list.length} user dari room ${room}.`, "success");
-    }else{
+    } else {
       el("participantsList").innerHTML = '<div class="flex items-center justify-center h-full text-xs text-slate-500 py-10">Tidak ada peserta.</div>';
-      showActionNotice("LIST USER", "Request berhasil, tetapi server tidak mengembalikan daftar peserta.", "warning");
     }
   }catch(e){
-    const message = e.message || String(e);
-    el("participantsList").innerHTML = `<div class="flex items-center justify-center h-full text-xs text-rose-300 py-10 px-3 text-center break-words">${esc(message)}</div>`;
-    showActionNotice("LIST USER", message);
   }
 }
 
